@@ -88,10 +88,27 @@ main.py          — CLI entry point, demo mode, watch mode
 analyzer.py      — Pure SMC engine (swing detection, OB, FVG, liquidity, scoring)
 fetcher.py       — Binance REST API wrapper (no API key needed)
 renderer.py      — ANSI terminal report renderer
+bot.py           — Telegram bot initilizer       
 requirements.txt
 ```
 
 ---
+
+## Bot
+
+```
+.env file or environment cofiguration is required to start the bot.
+For example:
+```bash
+TELEGRAM_BOT_TOKEN=your_token_here
+WATCH_INTERVAL_SECONDS=1800   # how often to scan in watch mode (default: 30 min)
+MIN_ALERT_PROBABILITY=70      # only push alerts at or above this win probability %
+MIN_ALERT_CONFLUENCE=70       # only push alerts at or above this confluence score
+```
+```
+
+---
+
 
 ## Notes
 
