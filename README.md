@@ -99,12 +99,11 @@ requirements.txt
 ```
 .env file or environment cofiguration is required to start the bot.
 For example:
-```bash
+
 TELEGRAM_BOT_TOKEN=your_token_here
 WATCH_INTERVAL_SECONDS=1800   # how often to scan in watch mode (default: 30 min)
 MIN_ALERT_PROBABILITY=70      # only push alerts at or above this win probability %
 MIN_ALERT_CONFLUENCE=70       # only push alerts at or above this confluence score
-```
 ```
 
 ---
