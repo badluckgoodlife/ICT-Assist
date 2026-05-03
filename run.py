@@ -7,7 +7,7 @@ import os
 
 env = os.environ.copy()
 env["FORCE_COLOR"] = "1"
-subprocess.run([sys.executable, "main.py", "--watch"],env=env)
+subprocess.run([sys.executable, "main.py"],env=env)
 
 '''
 subprocess.run([sys.executable, "pip", "install", "-r", "requirements.txt"])
