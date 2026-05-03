@@ -112,7 +112,14 @@ class SMCEngine:
     All prices are raw floats. No I/O here.
     """
 
-    def __init__(self, swing_lookback: int = 5):
+    # Minimum confluence score to generate a signal (A+ gate)
+    MIN_CONFLUENCE_SCORE = 65
+    # OB must have moved at least this far from current price to be valid
+    MIN_OB_DISTANCE_PCT  = 0.003   # 0.3 %
+    # OBs weaker than this are discarded
+    MIN_OB_STRENGTH      = 0.20
+
+    def __init__(self, swing_lookback: int = 8):
         self.swing_lookback = swing_lookback
 
     # ── Swing Detection ──────────────────────────────────────────────────────
@@ -173,31 +180,54 @@ class SMCEngine:
 
     def find_structure_breaks(self, df: pd.DataFrame,
                                swings: list[SwingPoint]) -> list[StructurePoint]:
-        """Detect BOS and CHoCH from close prices vs swing levels."""
-        breaks: list[StructurePoint] = []
-        highs = [s for s in swings if s.kind in ('HH', 'LH')]
-        lows  = [s for s in swings if s.kind in ('HL', 'LL')]
+        """
+        Detect BOS and CHoCH from close prices vs swing levels.
 
-        bias = Bias.NEUTRAL
+        Fix: each swing level is consumed exactly once.  After a break the
+        reference advances to the NEXT swing that forms in the future —
+        preventing hundreds of phantom breaks firing on the same static level.
+        """
+        breaks: list[StructurePoint] = []
+        bias   = Bias.NEUTRAL
+
+        # Separate and sort swing highs / lows chronologically
+        sh_list = sorted([s for s in swings if s.kind in ('HH', 'LH')], key=lambda s: s.index)
+        sl_list = sorted([s for s in swings if s.kind in ('HL', 'LL')], key=lambda s: s.index)
+
+        sh_ptr = 0                      # next candidate swing high to activate
+        sl_ptr = 0                      # next candidate swing low  to activate
+        active_sh: Optional[SwingPoint] = None   # current unbroken swing high
+        active_sl: Optional[SwingPoint] = None   # current unbroken swing low
 
         for i in range(len(df)):
             close = df['close'].iloc[i]
 
-            # Bullish break above last swing high
-            if highs:
-                last_h = highs[-1]
-                if close > last_h.price and i > last_h.index:
-                    kind = 'BOS_bull' if bias == Bias.BULLISH else 'CHoCH_bull'
-                    breaks.append(StructurePoint(last_h.price, kind, i))
-                    bias = Bias.BULLISH
+            # ── Activate the most recent swing high formed strictly before bar i
+            #    Only when we have no active level (i.e. the previous one was consumed)
+            if active_sh is None:
+                while sh_ptr < len(sh_list) and sh_list[sh_ptr].index < i:
+                    active_sh = sh_list[sh_ptr]
+                    sh_ptr += 1
 
-            # Bearish break below last swing low
-            if lows:
-                last_l = lows[-1]
-                if close < last_l.price and i > last_l.index:
-                    kind = 'BOS_bear' if bias == Bias.BEARISH else 'CHoCH_bear'
-                    breaks.append(StructurePoint(last_l.price, kind, i))
-                    bias = Bias.BEARISH
+            # ── Activate the most recent swing low formed strictly before bar i
+            if active_sl is None:
+                while sl_ptr < len(sl_list) and sl_list[sl_ptr].index < i:
+                    active_sl = sl_list[sl_ptr]
+                    sl_ptr += 1
+
+            # ── Bullish break: close above the active swing high
+            if active_sh and close > active_sh.price:
+                kind = 'BOS_bull' if bias == Bias.BULLISH else 'CHoCH_bull'
+                breaks.append(StructurePoint(active_sh.price, kind, i))
+                bias      = Bias.BULLISH
+                active_sh = None    # consumed — must wait for the next swing high to form
+
+            # ── Bearish break: close below the active swing low
+            if active_sl and close < active_sl.price:
+                kind = 'BOS_bear' if bias == Bias.BEARISH else 'CHoCH_bear'
+                breaks.append(StructurePoint(active_sl.price, kind, i))
+                bias      = Bias.BEARISH
+                active_sl = None    # consumed — must wait for the next swing low to form
 
         return breaks
 
@@ -214,8 +244,8 @@ class SMCEngine:
 
         # Bullish OBs — look for bearish candles before upswing
         for sh in swing_highs:
-            # Find last bearish candle before this swing high
-            for j in range(sh - 1, max(sh - 10, 0), -1):
+            # Find last bearish candle before this swing high (look back up to 15 bars)
+            for j in range(sh - 1, max(sh - 15, 0), -1):
                 o, c = df['open'].iloc[j], df['close'].iloc[j]
                 if c < o:  # bearish candle
                     vol = df['volume'].iloc[j] if 'volume' in df else 0
@@ -224,6 +254,8 @@ class SMCEngine:
                     post_move = df['high'].iloc[sh] - df['high'].iloc[j]
                     strength = min(post_move / max(ob_size, 1e-8), 1.0) * 0.5
                     strength = round(min(strength, 1.0), 2)
+                    if strength < self.MIN_OB_STRENGTH:
+                        break   # weak OB — skip this swing entirely
                     ob = OrderBlock(
                         high=max(o, c), low=min(o, c),
                         mid=(o + c) / 2, kind='bullish',
@@ -234,7 +266,7 @@ class SMCEngine:
 
         # Bearish OBs — look for bullish candles before downswing
         for sl in swing_lows:
-            for j in range(sl - 1, max(sl - 10, 0), -1):
+            for j in range(sl - 1, max(sl - 15, 0), -1):
                 o, c = df['open'].iloc[j], df['close'].iloc[j]
                 if c > o:  # bullish candle
                     vol = df['volume'].iloc[j] if 'volume' in df else 0
@@ -242,6 +274,8 @@ class SMCEngine:
                     post_move = df['low'].iloc[j] - df['low'].iloc[sl]
                     strength = min(post_move / max(ob_size, 1e-8), 1.0) * 0.5
                     strength = round(min(strength, 1.0), 2)
+                    if strength < self.MIN_OB_STRENGTH:
+                        break   # weak OB — skip this swing entirely
                     ob = OrderBlock(
                         high=max(o, c), low=min(o, c),
                         mid=(o + c) / 2, kind='bearish',
@@ -250,19 +284,28 @@ class SMCEngine:
                     obs.append(ob)
                     break
 
-        # Mark mitigated OBs (price has returned into them)
-        current_price = df['close'].iloc[-1]
+        # Mark mitigated OBs.
+        # An OB is mitigated when price has returned INTO the zone (any wick
+        # touching ob.high for bullish, ob.low for bearish) on a candle that
+        # formed AFTER the OB itself.  This is distinct from mere invalidation
+        # (price closing through the far side), which is a stricter condition
+        # that the old code was using instead.
         for ob in obs:
-            if ob.kind == 'bullish' and current_price < ob.low:
-                ob.mitigated = True
-            elif ob.kind == 'bearish' and current_price > ob.high:
-                ob.mitigated = True
+            post = df.iloc[ob.index + 1:]      # all candles after the OB formed
+            if ob.kind == 'bullish':
+                # Mitigated: any post-OB candle's low traded at or below the OB top
+                if not post.empty and (post['low'] <= ob.high).any():
+                    ob.mitigated = True
+            else:  # bearish
+                # Mitigated: any post-OB candle's high traded at or above the OB bottom
+                if not post.empty and (post['high'] >= ob.low).any():
+                    ob.mitigated = True
 
         return [ob for ob in obs if not ob.mitigated]
 
     # ── Fair Value Gaps ───────────────────────────────────────────────────────
 
-    def find_fvgs(self, df: pd.DataFrame, min_size_pct: float = 0.03) -> list[FairValueGap]:
+    def find_fvgs(self, df: pd.DataFrame, min_size_pct: float = 0.15) -> list[FairValueGap]:
         """
         FVG: 3-candle imbalance.
         Bullish FVG: candle[i-2].high < candle[i].low  (gap up)
@@ -358,33 +401,48 @@ class SMCEngine:
                   swing_highs: list[int],
                   swing_lows: list[int]) -> dict:
         """
-        Fibonacci-based premium/discount zones from recent range.
-        Equilibrium = 0.5, Discount < 0.5, Premium > 0.5
+        Fibonacci-based premium/discount zones.
+        Equilibrium = 0.5, Discount < 0.5, Premium > 0.5.
+
+        Fix: range is anchored to the most recent meaningful swing high and
+        swing low detected by find_swings(), not to an arbitrary 50-bar window.
+        This ensures the Fibonacci levels correspond to a real price structure.
         """
         if not swing_highs or not swing_lows:
             return {}
 
-        # Use most recent significant range
-        last_n = 50
-        sub = df.iloc[-last_n:]
-        rng_high = sub['high'].max()
-        rng_low  = sub['low'].min()
-        rng      = rng_high - rng_low
-        if rng == 0:
+        # Collect all swing high/low prices with their bar indices
+        sh_pairs = [(i, df['high'].iloc[i]) for i in swing_highs]
+        sl_pairs = [(i, df['low'].iloc[i])  for i in swing_lows]
+
+        # Use the most recent swing high and swing low as range anchors
+        last_sh_idx, rng_high = max(sh_pairs, key=lambda x: x[0])
+        last_sl_idx, rng_low  = max(sl_pairs, key=lambda x: x[0])
+
+        # If the most-recent high is below the most-recent low (can happen in
+        # strong trends), fall back to the absolute highest high / lowest low
+        # across all detected swings so the range is always valid.
+        if rng_high <= rng_low:
+            rng_high = max(p for _, p in sh_pairs)
+            rng_low  = min(p for _, p in sl_pairs)
+
+        rng = rng_high - rng_low
+        if rng == 0 or rng / max(rng_low, 1e-8) < 0.005:
             return {}
 
-        current = df['close'].iloc[-1]
-        fib_pos  = (current - rng_low) / rng  # 0 = at low, 1 = at high
+        current  = df['close'].iloc[-1]
+        fib_pos  = (current - rng_low) / rng
+        fib_pos  = round(max(0.0, min(1.0, fib_pos)), 4)
 
         return {
-            'range_high':   rng_high,
-            'range_low':    rng_low,
-            'equilibrium':  rng_low + rng * 0.5,
-            'ote_high':     rng_low + rng * 0.79,   # OTE zone
-            'ote_low':      rng_low + rng * 0.618,
-            'fib_705':      rng_low + rng * 0.705,  # Sweet spot
-            'fib_pos':      round(fib_pos, 4),
-            'zone':         'DISCOUNT' if fib_pos < 0.5 else 'PREMIUM'
+            'range_high':  rng_high,
+            'range_low':   rng_low,
+            'equilibrium': rng_low + rng * 0.5,
+            'ote_high':    rng_low + rng * 0.79,    # OTE zone top
+            'ote_low':     rng_low + rng * 0.618,   # OTE zone bottom
+            'fib_705':     rng_low + rng * 0.705,   # Sweet spot
+            'fib_pos':     fib_pos,
+            'zone':        'DISCOUNT' if fib_pos < 0.5 else 'PREMIUM',
         }
 
     # ── Volume Analysis ───────────────────────────────────────────────────────
@@ -433,6 +491,37 @@ class SMCEngine:
             'is_high_vol': rel_vol > 1.3,
             'bias':       'BULLISH' if avg_delta > 0.55 else ('BEARISH' if avg_delta < 0.45 else 'NEUTRAL')
         }
+
+    # ── Killzone Detection ────────────────────────────────────────────────────
+
+    def in_killzone(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        Check whether the most recent candle falls inside an ICT killzone.
+        All times are converted to US/Eastern (handles EST/EDT automatically).
+
+        Killzones:
+          London Open   02:00 – 05:00 EST
+          NY AM Open    07:00 – 10:00 EST
+          London Close  10:00 – 12:00 EST
+        """
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+
+        last_ts = df.index[-1]
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+
+        est_ts   = last_ts.astimezone(ZoneInfo('America/New_York'))
+        h        = est_ts.hour + est_ts.minute / 60.0
+
+        if  2.0 <= h <  5.0:
+            return True,  "London Open (02:00–05:00 EST)"
+        if  7.0 <= h < 10.0:
+            return True,  "NY AM Open  (07:00–10:00 EST)"
+        if 10.0 <= h < 12.0:
+            return True,  "London Close (10:00–12:00 EST)"
+
+        return False, ""
 
     # ── Setup Scoring ─────────────────────────────────────────────────────────
 
@@ -522,23 +611,17 @@ class SMCEngine:
             elif signal == SignalType.SHORT and zone == 'DISCOUNT':
                 warnings.append(f"Shorting in DISCOUNT zone (fib={fib:.2%}) — suboptimal entry")
 
-        # ── Volume confirmation (5 pts) ──
+        # ── Volume — display only, not scored ──────────────────────────────
+        # ICT is a pure price-action methodology; volume is not part of the
+        # scoring model.  Volume data is still surfaced in the report for the
+        # trader's awareness but it does not influence confluence points.
         if vol.get('available'):
-            rv = vol.get('rel_vol', 1.0)
+            rv    = vol.get('rel_vol', 1.0)
             vbias = vol.get('bias', 'NEUTRAL')
-            if rv > 1.3:
-                score += 3
-                reasons.append(f"High relative volume ({rv:.1f}x average)")
-            if vbias == 'BULLISH' and signal == SignalType.LONG:
-                score += 2
-                reasons.append("Volume delta confirms bullish pressure")
-            elif vbias == 'BEARISH' and signal == SignalType.SHORT:
-                score += 2
-                reasons.append("Volume delta confirms bearish pressure")
-            elif vbias != 'NEUTRAL':
-                warnings.append(f"Volume delta ({vbias}) diverges from signal")
-        else:
-            warnings.append("Volume data unavailable — unconfirmed setup")
+            if rv > 1.5:
+                reasons.append(f"[info] Relative volume elevated ({rv:.1f}x avg) — not scored")
+            if vbias != 'NEUTRAL':
+                reasons.append(f"[info] Volume-delta bias: {vbias} — not scored")
 
         # Recent CHoCH bonus
         recent_choch = [s for s in structure_breaks[-5:] if 'CHoCH' in s.kind]
@@ -686,22 +769,33 @@ class SMCEngine:
             )
 
         # ── Find Best OB ──
-        target_obs = [o for o in obs if o.kind == ('bullish' if signal == SignalType.LONG else 'bearish')]
-        # Prefer closest OB to current price
-        if target_obs:
-            best_ob = sorted(
-                target_obs,
-                key=lambda o: abs(o.mid - current_price)
-            )[0]
-        else:
-            best_ob = None
+        # Must be at least MIN_OB_DISTANCE_PCT away from current price
+        # (price hasn't touched it yet → clean, untested level)
+        # Rank by strength, not proximity — we want quality, not the nearest noise.
+        target_obs = [
+            o for o in obs
+            if o.kind == ('bullish' if signal == SignalType.LONG else 'bearish')
+            and (
+                (signal == SignalType.LONG  and o.high < current_price * (1 - self.MIN_OB_DISTANCE_PCT))
+                or
+                (signal == SignalType.SHORT and o.low  > current_price * (1 + self.MIN_OB_DISTANCE_PCT))
+            )
+        ]
+        best_ob = max(target_obs, key=lambda o: o.strength) if target_obs else None
 
         # ── Find Best FVG ──
-        target_fvgs = [f for f in fvgs if f.kind == ('bullish' if signal == SignalType.LONG else 'bearish')]
-        if target_fvgs:
-            best_fvg = sorted(target_fvgs, key=lambda f: abs(f.mid - current_price))[0]
-        else:
-            best_fvg = None
+        # Same distance requirement — price should not yet have reached the gap.
+        target_fvgs = [
+            f for f in fvgs
+            if f.kind == ('bullish' if signal == SignalType.LONG else 'bearish')
+            and (
+                (signal == SignalType.LONG  and f.high < current_price * (1 - self.MIN_OB_DISTANCE_PCT))
+                or
+                (signal == SignalType.SHORT and f.low  > current_price * (1 + self.MIN_OB_DISTANCE_PCT))
+            )
+        ]
+        # Prefer the largest (most significant) untested FVG
+        best_fvg = max(target_fvgs, key=lambda f: f.size_pct) if target_fvgs else None
 
         # ── Find Nearest Opposing Liquidity ──
         if signal == SignalType.LONG:
@@ -716,6 +810,20 @@ class SMCEngine:
             structure_breaks, signal
         )
 
+        # ── Killzone Check ──
+        # ICT setups are only high-probability when formed inside a session
+        # killzone.  Outside a killzone we don't block the signal but we warn
+        # clearly and penalise probability, because random-hour entries are the
+        # primary source of false positives in this methodology.
+        in_kz, kz_name = self.in_killzone(ltf_df)
+        if in_kz:
+            reasons.append(f"✓ Inside ICT killzone: {kz_name}")
+        else:
+            warnings.append(
+                "Outside ICT killzone — London Open (02–05 EST) and NY AM (07–10 EST) "
+                "are the high-probability windows.  Consider waiting."
+            )
+
         # ── Entry & Stops ──
         entry, stop = self.compute_entry(
             signal, best_ob, best_fvg, current_price,
@@ -729,11 +837,28 @@ class SMCEngine:
         # ── Probability Estimate ──
         # Bayesian-style: base rate 45%, adjust for confluence
         prob = 35 + (score / 100) * 50  # 35-85% range
-        if vol.get('available') and not vol.get('is_high_vol'):
-            prob -= 5  # penalise low-volume setups
+        if not in_kz:
+            prob -= 10  # outside killzone — significant edge reduction
         if best_ob and best_ob.strength > 0.5:
             prob += 5
         prob = round(min(max(prob, 20), 85), 1)
+
+        # ── A+ Gate ── Only return a tradeable signal if confluence is strong enough
+        if score < self.MIN_CONFLUENCE_SCORE or rr < 2.0:
+            gate_reason = (
+                f"Confluence score {score:.0f}/100 below A+ threshold ({self.MIN_CONFLUENCE_SCORE})"
+                if score < self.MIN_CONFLUENCE_SCORE
+                else f"Risk/reward {rr:.1f} below minimum 2.0 — setup not worth the risk"
+            )
+            return TradeSetup(
+                signal=SignalType.WAIT,
+                entry_price=current_price,
+                stop_loss=0, take_profit_1=0, take_profit_2=0, take_profit_3=0,
+                risk_reward=0, probability=prob, confluence_score=score,
+                reasons=reasons,
+                warnings=[gate_reason] + warnings,
+                htf_bias=htf_bias, ltf_bias=ltf_bias
+            )
 
         vol_confirmed = (
             vol.get('available', False) and
