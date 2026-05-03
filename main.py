@@ -101,7 +101,7 @@ def run_demo(symbol: str = "ETHUSDT", tf_mode: str = "1H-15m") -> None:
     ltf_df = generate_demo_data(symbol, n=200, base_price=float(htf_df['close'].iloc[-1]),
                                   trend=trend)
 
-    engine = SMCEngine(swing_lookback=5)
+    engine = SMCEngine(swing_lookback=8)
     setup  = engine.analyze(ltf_df, htf_df)
 
     current_price = float(ltf_df['close'].iloc[-1])
@@ -143,7 +143,7 @@ def run_live(symbol: str, tf_mode: str) -> bool:
     ticker = get_ticker(symbol)
     current_price = float(ltf_df['close'].iloc[-1])
 
-    engine = SMCEngine(swing_lookback=5)
+    engine = SMCEngine(swing_lookback=8)
     setup  = engine.analyze(ltf_df, htf_df)
 
     report = render_full_report(symbol, tf_mode, current_price, setup, ticker)
